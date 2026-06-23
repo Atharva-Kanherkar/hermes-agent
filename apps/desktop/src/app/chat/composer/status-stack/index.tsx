@@ -30,6 +30,11 @@ import { StatusItemRow } from './status-row'
 // emit no event when they die). Only armed while a running row is on screen.
 const BACKGROUND_POLL_MS = 5_000
 
+// A localhost/loopback preview is only meaningful while its dev server is up, so
+// we tie it to a live background process rather than persisting dismissals or
+// letting dead URLs pile up. File previews (a real on-disk artifact) stand alone.
+const isLocalhostPreview = (target: string): boolean => /\b(?:localhost|127\.0\.0\.1|0\.0\.0\.0)\b/i.test(target)
+
 // Real codicons per group (no sparkles): a checklist for todos, a bot for
 // subagents, a background process glyph for background tasks.
 const GROUP_ICON: Record<StatusGroup['type'], string> = {
@@ -82,6 +87,10 @@ export function ComposerStatusStack({ queue, sessionId }: ComposerStatusStackPro
 
   const hasRunningBackground = groups.some(g => g.type === 'background' && g.items.some(i => i.state === 'running'))
 
+  // Drop localhost previews once no dev server is left running — that's what made
+  // dead `localhost:5174` chips stick around. On-disk file previews are kept.
+  const visiblePreviews = previews.filter(item => hasRunningBackground || !isLocalhostPreview(item.target))
+
   useEffect(() => {
     if (!sessionId || !hasRunningBackground) {
       return
@@ -131,14 +140,14 @@ export function ComposerStatusStack({ queue, sessionId }: ComposerStatusStackPro
     )
   }))
 
-  if (previews.length > 0 && sessionId) {
+  if (visiblePreviews.length > 0 && sessionId) {
     sections.push({
       key: 'preview',
       // Not a collapsible group — preview links just sit there, one line each,
       // each individually closeable.
       node: (
         <div className="px-1 py-0.5">
-          {previews.map(item => (
+          {visiblePreviews.map(item => (
             <PreviewStatusRow item={item} key={item.id} onDismiss={id => dismissPreviewArtifact(sessionId, id)} />
           ))}
         </div>
