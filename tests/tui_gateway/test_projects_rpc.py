@@ -41,18 +41,51 @@ def test_for_cwd_is_a_long_handler():
 def test_repo_root_cache_does_not_freeze_a_not_yet_repo(monkeypatch):
     # We `git init` a new project's folder on first worktree; the cache must not
     # have frozen the pre-init "" result, or the main lane mislabels by basename.
+    # Negative results are TTL-cached; TTL=0 here makes them expire immediately so
+    # this verifies the "never permanently frozen" contract directly.
     from tui_gateway import git_probe
 
+    monkeypatch.setattr(git_probe, "_NEG_TTL", 0)
     cwd = "/tmp/baby pics"
     git_probe.invalidate()
     state = {"root": ""}  # flips once the folder becomes a repo
     monkeypatch.setattr(git_probe, "run_git", lambda c, *a: state["root"] if c == cwd else "")
 
-    assert git_probe.repo_root(cwd) == ""  # pre-init: not a repo (uncached)
+    assert git_probe.repo_root(cwd) == ""  # pre-init: not a repo (expires at once)
 
     state["root"] = cwd  # `git init` happened
     assert git_probe.repo_root(cwd) == cwd  # re-probed, not frozen
     assert git_probe.repo_root(cwd) == cwd  # now cached
+
+
+def test_negative_results_are_ttl_cached_then_re_probed(monkeypatch):
+    # A non-repo cwd is re-derived on every session in a project-tree build, so a
+    # "not a repo" answer must be cached briefly to avoid re-spawning git dozens
+    # of times — but only until the TTL elapses, so a folder that later becomes a
+    # repo is still picked up.
+    from tui_gateway import git_probe
+
+    git_probe.invalidate()
+    calls = {"n": 0}
+
+    def probe(_cwd, *_a):
+        calls["n"] += 1
+        return ""  # never a repo
+
+    monkeypatch.setattr(git_probe, "run_git", probe)
+    monkeypatch.setattr(git_probe, "_NEG_TTL", 1000)  # effectively no expiry here
+
+    cwd = "/not/a/repo"
+    assert git_probe.repo_root(cwd) == ""
+    for _ in range(10):
+        assert git_probe.repo_root(cwd) == ""
+    assert calls["n"] == 1  # cached: probed once, not 11 times
+
+    # Once the TTL lapses, the next lookup re-probes (a `git init` may have run).
+    monkeypatch.setattr(git_probe, "_NEG_TTL", 0)
+    git_probe._cache._neg[cwd] = 0.0  # force-expire the cached negative
+    assert git_probe.repo_root(cwd) == ""
+    assert calls["n"] == 2
 
 
 def test_repo_root_cache_is_single_flight(monkeypatch):

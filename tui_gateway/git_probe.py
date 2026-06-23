@@ -6,10 +6,20 @@ remote backends (unlike the desktop's electron probe, which only sees the local
 fs). Resolved roots are cached with a thread-safe, single-flight cache: the
 gateway's long handlers run on worker threads, so concurrent identical probes
 (e.g. two overlapping project-tree builds) share one `git` invocation instead of
-racing an unguarded dict. Only successful (non-empty) roots are cached — a
-not-yet-repo cwd must stay re-probable (we `git init` a new project's folder on
-first worktree, and a frozen "" would mislabel its main lane by the dir
-basename). `invalidate()` drops everything after a known mutation.
+racing an unguarded dict.
+
+Positive results are cached for the process lifetime; negative results (a cwd
+that isn't a git repo, or a deleted/nonexistent dir) are cached only for a short
+TTL (`_NEG_TTL`). Caching negatives matters a lot for the desktop Projects tree:
+``project_tree.build_tree`` resolves a cwd once *per session* (not per distinct
+cwd), so a power user with hundreds of sessions in non-git/deleted dirs would
+otherwise re-spawn ``git`` hundreds of times on *every* sidebar open — the cause
+of the multi-second "Projects" load. The TTL keeps a not-yet-repo cwd
+re-probable (we `git init` a new project's folder on its first worktree, and a
+frozen "" would mislabel its main lane by the dir basename) — it just stops the
+same "not a repo" answer from being re-derived dozens of times within one build
+and across rapid re-opens. `invalidate()` drops everything after a known
+mutation.
 """
 
 from __future__ import annotations
@@ -17,11 +27,18 @@ from __future__ import annotations
 import os
 import subprocess
 import threading
+import time
 from collections.abc import Iterable
 from concurrent.futures import ThreadPoolExecutor
 
 _GIT_TIMEOUT = 1.5
 _WARM_WORKERS = 8
+
+# How long a "not a git repo" answer stays cached before it's re-probed. Short
+# enough that a freshly `git init`-ed / newly-created folder shows correctly
+# within a few seconds; long enough to collapse the hundreds of redundant probes
+# a single project-tree build (and rapid re-opens) would otherwise fire.
+_NEG_TTL = 30.0
 
 
 def run_git(cwd: str, *args: str) -> str:
@@ -47,17 +64,21 @@ def branch(cwd: str) -> str:
 
 
 class _RootCache:
-    """Thread-safe, single-flight cache of git-root probes (positive results
-    only). Followers wait on the leader's probe instead of duplicating it."""
+    """Thread-safe, single-flight cache of git-root probes. Positive results are
+    cached for the process lifetime; negative ("not a repo") results are cached
+    only for ``_NEG_TTL`` seconds so a not-yet-repo cwd stays re-probable.
+    Followers wait on the leader's probe instead of duplicating it."""
 
     def __init__(self) -> None:
         self._lock = threading.Lock()
         self._roots: dict[str, str] = {}
+        self._neg: dict[str, float] = {}  # key -> monotonic expiry
         self._inflight: dict[str, threading.Event] = {}
 
     def invalidate(self) -> None:
         with self._lock:
             self._roots.clear()
+            self._neg.clear()
             self._inflight.clear()
 
     def resolve(self, key: str, probe) -> str:
@@ -66,6 +87,15 @@ class _RootCache:
                 hit = self._roots.get(key)
                 if hit:
                     return hit
+                expiry = self._neg.get(key)
+                if expiry is not None:
+                    if expiry > time.monotonic():
+                        # Recently probed as "not a repo" — trust it briefly
+                        # instead of re-spawning git for the same dead/non-repo
+                        # cwd on every session in the tree build.
+                        return ""
+                    # TTL elapsed: drop it and re-probe (it may be a repo now).
+                    del self._neg[key]
                 gate = self._inflight.get(key)
                 if gate is None:
                     gate = threading.Event()
@@ -86,6 +116,8 @@ class _RootCache:
                 with self._lock:
                     if value:
                         self._roots[key] = value
+                    else:
+                        self._neg[key] = time.monotonic() + _NEG_TTL
                     self._inflight.pop(key, None)
                 gate.set()
             return value

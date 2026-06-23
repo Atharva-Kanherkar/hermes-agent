@@ -178,6 +178,7 @@ _LONG_HANDLERS = frozenset(
         "billing.step_up",
         "browser.manage",
         "cli.exec",
+        "llm.oneshot",
         "plugins.manage",
         "projects.discover_repos",
         "projects.record_repos",
@@ -1204,6 +1205,75 @@ def _session_cwd(session: dict | None) -> str:
     return _completion_cwd()
 
 
+def _heal_dead_cwd(cwd: str) -> str:
+    """Resolve a session cwd that points at a now-deleted directory.
+
+    A session anchored to a linked worktree (``<repo>/.worktrees/<name>``) keeps
+    that path after the worktree is removed (branch merged, `git worktree
+    remove`, etc). The literal dir is gone, so a probe of it returns nothing and
+    the composer shows no branch — while the sidebar still folds the path up to
+    the repo's main lane. Heal the mismatch: walk up to the first existing
+    ancestor, then resolve its common git root, so a dead-worktree cwd collapses
+    to the live repo root (and its real current branch).
+
+    Only meaningful for local backends; a remote/SSH cwd may legitimately not
+    exist on the host, so callers must skip healing there.
+    """
+    raw = (cwd or "").strip()
+    if not raw or os.path.isdir(raw):
+        return raw
+
+    probe = raw
+    # Climb to the first ancestor that still exists on disk.
+    for _ in range(64):
+        parent = os.path.dirname(probe)
+        if not parent or parent == probe:
+            break
+        probe = parent
+        if os.path.isdir(probe):
+            break
+
+    if not os.path.isdir(probe):
+        return raw
+
+    try:
+        root = _git_common_repo_root_for_cwd(probe) or _git_repo_root_for_cwd(probe)
+    except Exception:
+        root = ""
+
+    return root or probe
+
+
+def _is_local_terminal_backend() -> bool:
+    backend = (os.environ.get("TERMINAL_ENV") or "").strip().lower()
+    return not backend or backend == "local"
+
+
+def _display_session_cwd(session: dict | None) -> str:
+    """Session cwd for display/probe surfaces, healed past deleted worktrees.
+
+    Persists the healed value back to the session row (best-effort, local only)
+    so the next load is already coherent and the sidebar lane stops showing a
+    session pinned to a vanished path.
+    """
+    cwd = _session_cwd(session)
+    if not _is_local_terminal_backend():
+        return cwd
+
+    healed = _heal_dead_cwd(cwd)
+    if healed and healed != cwd and session is not None:
+        session["cwd"] = healed
+        try:
+            with _session_db(session) as db:
+                if db is not None:
+                    db.update_session_cwd(session.get("session_key", ""), healed)
+        except Exception:
+            logger.debug("failed to persist healed session cwd", exc_info=True)
+        _persist_session_git_meta(session, healed)
+
+    return healed
+
+
 def _session_source(session: dict | None) -> str:
     if session:
         source = str(session.get("source") or "").strip()
@@ -1308,12 +1378,19 @@ def _ensure_session_db_row(session: dict) -> None:
         model_config["reasoning_config"] = reasoning
     if tier := session.get("create_service_tier_override"):
         model_config["service_tier"] = tier
+    # Branch lineage: stamp the same ``_branched_from`` marker the TUI /branch
+    # uses so list_sessions_rich keeps the branch listed and the desktop sidebar
+    # can nest it under its parent.
+    parent_session_id = session.get("parent_session_id") or None
+    if parent_session_id:
+        model_config["_branched_from"] = parent_session_id
     try:
         db.create_session(
             key,
             source=_session_source(session),
             model=row_model,
             model_config=model_config or None,
+            parent_session_id=parent_session_id,
             cwd=_session_cwd(session) if session.get("explicit_cwd") else None,
         )
     except Exception:
@@ -1324,6 +1401,35 @@ def _ensure_session_db_row(session: dict) -> None:
                 db.close()
             except Exception:
                 pass
+
+
+def _persist_branch_seed(session: dict) -> None:
+    """First-turn persist of a branch's copied transcript.
+
+    A branch is a draft until its first submit: the parent's messages live only
+    in ``session["history"]`` (they ride into the agent as ``conversation_history``,
+    which ``_flush_messages_to_session_db`` skips by identity). Without this the
+    branch row would resume missing its pre-branch context. Runs once; the row +
+    parent link are written by ``_ensure_session_db_row`` just before this.
+    """
+    if not session.get("parent_session_id") or session.get("_branch_seed_persisted"):
+        return
+    key = session.get("session_key")
+    if not key:
+        return
+    with session["history_lock"]:
+        seed = [dict(msg) for msg in (session.get("history") or [])]
+    if not seed:
+        return
+    with _session_db(session) as db:
+        if db is None:
+            return
+        try:
+            for msg in seed:
+                db.append_message(session_id=key, role=msg.get("role", "user"), content=msg.get("content"))
+            session["_branch_seed_persisted"] = True
+        except Exception:
+            logger.debug("branch seed persist failed", exc_info=True)
 
 
 @contextlib.contextmanager
@@ -2736,7 +2842,7 @@ def _session_info(agent, session: dict | None = None) -> dict:
             if candidate.get("agent") is agent:
                 session = candidate
                 break
-    cwd = _session_cwd(session)
+    cwd = _display_session_cwd(session)
     session_key = str(
         (session or {}).get("session_key") or getattr(agent, "session_id", "") or ""
     )
@@ -3008,6 +3114,57 @@ def _on_tool_start(sid: str, tool_call_id: str, name: str, args: dict):
         _emit("tool.start", sid, payload)
 
 
+def _maybe_reanchor_session_from_terminal_result(sid: str, session: dict | None, result_obj: object) -> None:
+    """Sync sidebar/session cwd anchor to terminal's effective cwd.
+
+    Session grouping in `projects.project_sessions` keys off persisted session
+    `cwd` + `git_branch`, while terminal transcript lines can reflect a newer
+    in-turn `cd`. When those diverge, the sidebar lane and transcript context
+    disagree ("why is this test1 session under main?"). Terminal now reports its
+    post-command cwd; apply it here so branch lanes stay truthful.
+    """
+    if session is None or not isinstance(result_obj, dict):
+        return
+
+    # Background starts return a process/session id but do not carry a completed
+    # shell-state transition. Keep the anchor unchanged until a foreground tool
+    # result reports an actual cwd.
+    if result_obj.get("session_id"):
+        return
+
+    next_cwd = str(result_obj.get("cwd") or "").strip()
+    if not next_cwd:
+        return
+
+    prev_cwd = str(session.get("cwd") or "").strip()
+    if next_cwd == prev_cwd:
+        return
+
+    session["cwd"] = next_cwd
+    session["explicit_cwd"] = True
+    _register_session_cwd(session)
+
+    with _session_db(session) as db:
+        if db is not None:
+            try:
+                db.update_session_cwd(session.get("session_key", ""), next_cwd)
+            except Exception:
+                logger.debug("failed to persist session cwd from terminal result", exc_info=True)
+
+    _persist_session_git_meta(session, next_cwd)
+
+    try:
+        agent = session.get("agent")
+        info = (
+            _session_info(agent, session)
+            if agent is not None
+            else {"cwd": next_cwd, "branch": _git_branch_for_cwd(next_cwd), "lazy": True}
+        )
+        _emit("session.info", sid, info)
+    except Exception:
+        logger.debug("failed to emit session.info after terminal cwd reanchor", exc_info=True)
+
+
 def _on_tool_complete(sid: str, tool_call_id: str, name: str, args: dict, result: str):
     payload = {"tool_id": tool_call_id, "name": name, "args": args}
     session = _sessions.get(sid)
@@ -3023,6 +3180,8 @@ def _on_tool_complete(sid: str, tool_call_id: str, name: str, args: dict, result
         payload["result"] = json.loads(result)
     except Exception:
         payload["result"] = result
+    if name == "terminal":
+        _maybe_reanchor_session_from_terminal_result(sid, session, payload["result"])
     summary = _tool_summary(name, result, duration_s)
     if summary:
         payload["summary"] = summary
@@ -4335,6 +4494,10 @@ def _(rid, params: dict) -> dict:
     cols = int(params.get("cols", 80))
     history = _coerce_seed_history(params.get("messages"))
     title = str(params.get("title") or "").strip()
+    # When set, this is a branch: the new chat copies an existing conversation's
+    # history and links back to it so list_sessions_rich keeps it visible and the
+    # sidebar can nest it under its parent. Mirrors the TUI /branch marker.
+    parent_session_id = str(params.get("parent_session_id") or "").strip() or None
     # Did the client pick a workspace, or are we falling back to the gateway's
     # launch directory? Only an explicit choice is persisted as the session's
     # workspace (see _ensure_session_db_row); otherwise it lands in "No
@@ -4406,6 +4569,7 @@ def _(rid, params: dict) -> dict:
             "model_override": session_model_override,
             "create_reasoning_override": create_reasoning_override,
             "create_service_tier_override": create_service_tier_override,
+            "parent_session_id": parent_session_id,
             "pending_title": title or None,
             "profile_home": str(profile_home) if profile_home is not None else None,
             "running": False,
@@ -4418,6 +4582,7 @@ def _(rid, params: dict) -> dict:
             "transport": current_transport() or _stdio_transport,
         }
         _register_session_cwd(_sessions[sid])
+
     # NOTE: we intentionally do NOT persist a DB row here. Every TUI/desktop
     # launch (and every "New agent" / draft) opens a session here just to paint
     # the composer, so eagerly creating a row left an "Untitled" empty session
@@ -5211,6 +5376,84 @@ def _(rid, params: dict) -> dict:
         return _err(rid, 5007, str(e))
 
 
+def _main_runtime_from_agent(agent) -> dict | None:
+    """Build an aux-client main_runtime override from a live agent.
+
+    Lets a one-shot inherit the session's provider/model/credentials so its
+    output matches the model the user is actually coding with, instead of
+    falling back to the cheapest auto-detected backend.
+    """
+    if agent is None:
+        return None
+    runtime: dict = {}
+    for field in ("provider", "model", "base_url", "api_key", "api_mode", "auth_mode"):
+        value = getattr(agent, field, None)
+        if isinstance(value, str) and value.strip():
+            runtime[field] = value.strip()
+        elif field == "api_key" and callable(value):
+            runtime[field] = value
+    return runtime or None
+
+
+@method("llm.oneshot")
+def _(rid, params: dict) -> dict:
+    """Run a single stateless LLM request outside any conversation.
+
+    Generic helper for small generative chores (e.g. a commit message from a
+    diff). Accepts either a named ``template`` + ``variables`` or an explicit
+    ``instructions`` / ``input`` pair. When ``session_id`` resolves to a live
+    session the call inherits that agent's model; otherwise it uses the
+    configured auxiliary ``task`` backend. Never mutates session history, so
+    prompt caching is untouched.
+    """
+    template = (params.get("template") or "").strip() or None
+    instructions = params.get("instructions") or ""
+    user_input = params.get("input") or ""
+    variables = params.get("variables") if isinstance(params.get("variables"), dict) else {}
+    task = (params.get("task") or "title_generation").strip() or "title_generation"
+
+    try:
+        max_tokens = int(params.get("max_tokens") or 1024)
+    except (TypeError, ValueError):
+        max_tokens = 1024
+    temperature = params.get("temperature")
+    if temperature is not None:
+        try:
+            temperature = float(temperature)
+        except (TypeError, ValueError):
+            temperature = None
+
+    if not template and not str(instructions).strip() and not str(user_input).strip():
+        return _err(rid, 4030, "llm.oneshot requires a template or instructions/input")
+
+    # Optional: inherit the live session's model (no error if absent).
+    session = _sessions.get(params.get("session_id") or "")
+    main_runtime = _main_runtime_from_agent(session.get("agent")) if session else None
+
+    try:
+        from agent.oneshot import run_oneshot
+
+        text = run_oneshot(
+            instructions=instructions,
+            user_input=user_input,
+            template=template,
+            variables=variables,
+            task=task,
+            max_tokens=max_tokens,
+            temperature=temperature if temperature is not None else 0.3,
+            main_runtime=main_runtime,
+        )
+    except KeyError as e:
+        return _err(rid, 4031, str(e))
+    except ValueError as e:
+        return _err(rid, 4032, str(e))
+    except Exception as e:
+        logger.warning("llm.oneshot failed: %s", e)
+        return _err(rid, 5030, f"one-shot generation failed: {e}")
+
+    return _ok(rid, {"text": text})
+
+
 @method("handoff.request")
 def _(rid, params: dict) -> dict:
     """Queue a handoff of this session to a messaging platform.
@@ -5969,8 +6212,23 @@ def _(rid, params: dict) -> dict:
     session, err = _sess(params, rid)
     if err:
         return err
-    if hasattr(session["agent"], "interrupt"):
+    # Safety net: if the turn's run thread is already gone but `running` stayed
+    # stuck (a crash/desync that skipped the run loop's `finally`), force-clear it
+    # so the session can't be permanently bricked at 4009 "session busy" — every
+    # send/restore/resume would otherwise reject until a full backend restart.
+    # A genuinely live turn is left alone: its cooperative interrupt + `finally`
+    # release `running` the normal way; clearing it here would let a second turn
+    # race the first on the same session.
+    run_thread = session.get("_run_thread")
+    run_thread_alive = run_thread is not None and run_thread.is_alive()
+    should_interrupt = bool(session.get("running")) and run_thread_alive
+    if should_interrupt and hasattr(session["agent"], "interrupt"):
         session["agent"].interrupt()
+    if not run_thread_alive:
+        with session["history_lock"]:
+            if session.get("running"):
+                session["running"] = False
+                _clear_inflight_turn(session)
     # Scope the pending-prompt release to THIS session.  A global
     # _clear_pending() would collaterally cancel clarify/sudo/secret
     # prompts on unrelated sessions sharing the same tui_gateway
@@ -6292,6 +6550,9 @@ def _(rid, params: dict) -> dict:
 
     # Persist the DB row lazily, now that the user has actually sent a message.
     _ensure_session_db_row(session)
+    # A branch becomes real here: copy its parent's transcript into the row so it
+    # resumes with full context (the agent won't persist the seed itself).
+    _persist_branch_seed(session)
     _start_agent_build(sid, session)
 
     def run_after_agent_ready() -> None:
@@ -6312,7 +6573,11 @@ def _(rid, params: dict) -> dict:
             return
         _run_prompt_submit(rid, sid, session, text)
 
-    threading.Thread(target=run_after_agent_ready, daemon=True).start()
+    run_thread = threading.Thread(target=run_after_agent_ready, daemon=True)
+    # Keep a handle so session.interrupt can tell a live turn from a stuck
+    # `running` flag (a turn that died without clearing it) and recover the latter.
+    session["_run_thread"] = run_thread
+    run_thread.start()
     return _ok(rid, {"status": "streaming"})
 
 
@@ -6521,6 +6786,11 @@ def _run_prompt_submit(rid, sid: str, session: dict, text: Any) -> None:
         if not isinstance(session.get("inflight_turn"), dict):
             _start_inflight_turn(session, text)
     agent = session["agent"]
+    if hasattr(agent, "clear_interrupt"):
+        try:
+            agent.clear_interrupt()
+        except Exception:
+            pass
     _emit("message.start", sid)
 
     def run():
@@ -6819,12 +7089,19 @@ def _run_prompt_submit(rid, sid: str, session: dict, text: Any) -> None:
                 try:
                     from agent.title_generator import maybe_auto_title
 
+                    _title_key = session.get("session_key") or sid
                     maybe_auto_title(
                         _get_db(),
-                        session.get("session_key") or sid,
+                        _title_key,
                         text,
                         raw,
                         session.get("history", []),
+                        # Push the generated title live so the sidebar renames
+                        # without waiting for the next list refresh (the titler
+                        # runs async, after this turn's refresh already fired).
+                        title_callback=lambda t, _k=_title_key: _emit(
+                            "session.title", sid, {"session_id": _k, "title": t}
+                        ),
                     )
                 except Exception:
                     pass

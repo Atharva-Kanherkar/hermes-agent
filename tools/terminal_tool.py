@@ -2183,6 +2183,9 @@ def terminal_tool(
                     "exit_code": 0,
                     "error": None,
                 }
+                current_cwd = getattr(env, "cwd", None)
+                if isinstance(current_cwd, str) and current_cwd.strip():
+                    result_data["cwd"] = current_cwd
                 if approval_note:
                     result_data["approval"] = approval_note
                 if pty_disabled_reason:
@@ -2495,6 +2498,9 @@ def terminal_tool(
                 "exit_code": returncode,
                 "error": None,
             }
+            current_cwd = getattr(env, "cwd", None)
+            if isinstance(current_cwd, str) and current_cwd.strip():
+                result_dict["cwd"] = current_cwd
             if approval_note:
                 result_dict["approval"] = approval_note
             if exit_note:
